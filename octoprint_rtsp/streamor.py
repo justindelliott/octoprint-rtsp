@@ -96,7 +96,7 @@ class Streamor:
             '-y',
             '-rtsp_transport', 'tcp',
             '-rtsp_flags', 'prefer_tcp',
-            '-stimeout', '5000000',
+            '-timeout', '5000000',
             '-i', self.url,
             '-f', 'image2pipe',
             '-pix_fmt', 'yuv420p',
