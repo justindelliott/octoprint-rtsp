@@ -55,6 +55,14 @@ Nathen Fredrick (soopahfly@gmail.com)
 
 ## Changelog
 
+### Unreleased
+- **Improved**: Reduced CPU and memory pressure when transcoding RTSP streams for low-power devices like Raspberry Pi 3B
+- **Improved**: FFmpeg now applies framerate and resolution limits before MJPEG encoding
+- **Improved**: Streaming no longer blocks Tornado's I/O loop while waiting for frames
+- **Improved**: Stops the background FFmpeg process after streams or snapshots have been idle for 60 seconds
+- **Improved**: Reduced per-frame buffer copying and noisy FFmpeg/log output
+- **Fixed**: Added safer FFmpeg shutdown and validation for invalid or excessive framerate settings
+
 ### v1.0.3
 - **Security**: Enabled `is_blueprint_protected()` - /snapshot and /control now require authentication
 - **Security**: Added explicit `is_blueprint_csrf_protected()` returning True with CSRF exemption for /snapshot GET
