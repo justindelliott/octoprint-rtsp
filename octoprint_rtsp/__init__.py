@@ -9,6 +9,7 @@ import urllib.request
 import urllib.error
 import tornado.web
 import tornado.gen
+import tornado.ioloop
 from .streamor import Streamor
 
 # Global reference to plugin instance for Tornado handler
@@ -20,11 +21,11 @@ class MjpegStreamHandler(tornado.web.RequestHandler):
 
     def initialize(self):
         self._closed = False
+        self._registered_client = False
 
     def on_connection_close(self):
         self._closed = True
-        if _plugin_instance:
-            _plugin_instance._logger.info("Stream client disconnected")
+        self._release_stream_client()
 
     @tornado.gen.coroutine
     def get(self):
@@ -55,17 +56,22 @@ class MjpegStreamHandler(tornado.web.RequestHandler):
             self.finish("Streamor not available")
             return
 
+        self._registered_client = True
+        plugin._register_stream_client()
+
         # Wait for first frame
         first_frame = None
-        for _ in range(50):  # Wait up to 5 seconds
-            first_frame = plugin._streamor.get_snapshot()
-            if first_frame:
-                break
-            yield tornado.gen.sleep(0.1)
+        _, first_frame = yield tornado.ioloop.IOLoop.current().run_in_executor(
+            None,
+            plugin._streamor.wait_for_frame,
+            None,
+            5.0
+        )
 
         if not first_frame:
             self.set_status(503)
             self.finish("No frames available")
+            self._release_stream_client()
             return
 
         # Set headers for MJPEG stream
@@ -79,47 +85,62 @@ class MjpegStreamHandler(tornado.web.RequestHandler):
 
         # Send first frame
         try:
-            self.write(b"--frame\r\n")
-            self.write(b"Content-Type: image/jpeg\r\n")
-            self.write(f"Content-Length: {len(first_frame)}\r\n\r\n".encode())
-            self.write(first_frame)
-            self.write(b"\r\n")
+            self.write(self._make_frame_part(first_frame))
             yield self.flush()
         except Exception as e:
             plugin._logger.error(f"Error sending first frame: {e}")
+            self._release_stream_client()
             return
 
         # Stream continuously
         frame_count = 1
         streamor = plugin._streamor
+        last_frame_id = streamor._last_frame_id
+        last_stream_log = time.time()
+        io_loop = tornado.ioloop.IOLoop.current()
 
-        while not self._closed and streamor and streamor.running:
-            # Get frame (with brief wait)
-            frame = None
-            with streamor._condition:
-                streamor._condition.wait(timeout=0.5)
-                frame = streamor.last_frame
+        try:
+            while not self._closed and streamor and streamor.running:
+                last_frame_id, frame = yield io_loop.run_in_executor(
+                    None,
+                    streamor.wait_for_frame,
+                    last_frame_id,
+                    5.0
+                )
 
-            if frame and not self._closed:
-                frame_count += 1
-                if frame_count % 30 == 0:  # Log every ~2 seconds
-                    plugin._logger.info(f"Streamed {frame_count} frames")
+                if frame and not self._closed:
+                    frame_count += 1
+                    now = time.time()
+                    if now - last_stream_log >= 10:
+                        plugin._logger.info(f"Streamed {frame_count} frames")
+                        last_stream_log = now
 
-                try:
-                    self.write(b"--frame\r\n")
-                    self.write(b"Content-Type: image/jpeg\r\n")
-                    self.write(f"Content-Length: {len(frame)}\r\n\r\n".encode())
-                    self.write(frame)
-                    self.write(b"\r\n")
-                    yield self.flush()
-                except tornado.iostream.StreamClosedError:
-                    plugin._logger.info("Stream closed by client")
-                    break
-                except Exception as e:
-                    plugin._logger.error(f"Error streaming frame: {e}")
-                    break
+                    try:
+                        self.write(self._make_frame_part(frame))
+                        yield self.flush()
+                    except tornado.iostream.StreamClosedError:
+                        plugin._logger.info("Stream closed by client")
+                        break
+                    except Exception as e:
+                        plugin._logger.error(f"Error streaming frame: {e}")
+                        break
+        finally:
+            plugin._logger.info(f"Stream ended after {frame_count} frames")
+            self._release_stream_client()
 
-        plugin._logger.info(f"Stream ended after {frame_count} frames")
+    def _make_frame_part(self, frame):
+        return (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            + f"Content-Length: {len(frame)}\r\n\r\n".encode()
+            + frame
+            + b"\r\n"
+        )
+
+    def _release_stream_client(self):
+        if self._registered_client and _plugin_instance:
+            self._registered_client = False
+            _plugin_instance._release_stream_client()
 
 
 class RtspPlugin(octoprint.plugin.StartupPlugin,
@@ -131,6 +152,9 @@ class RtspPlugin(octoprint.plugin.StartupPlugin,
     def __init__(self):
         self._streamor = None
         self._streamor_lock = threading.Lock()
+        self._stream_clients = 0
+        self._idle_timer = None
+        self._idle_timeout = 60.0
 
     def on_after_startup(self):
         global _plugin_instance
@@ -180,6 +204,7 @@ class RtspPlugin(octoprint.plugin.StartupPlugin,
 
         if self._streamor:
             self._streamor.stop()
+        self._cancel_idle_timer()
 
         # Initialize new streamor with new settings
         self._streamor = Streamor(
@@ -193,6 +218,43 @@ class RtspPlugin(octoprint.plugin.StartupPlugin,
             custom_cmd=custom_args,
             logger=self._logger
         )
+
+    def _register_stream_client(self):
+        with self._streamor_lock:
+            self._cancel_idle_timer()
+            self._stream_clients += 1
+            self._logger.info(f"RTSP stream clients: {self._stream_clients}")
+
+    def _release_stream_client(self):
+        with self._streamor_lock:
+            if self._stream_clients > 0:
+                self._stream_clients -= 1
+            self._logger.info(f"RTSP stream clients: {self._stream_clients}")
+            if self._stream_clients == 0:
+                self._schedule_idle_stop()
+
+    def _cancel_idle_timer(self):
+        if self._idle_timer:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    def _schedule_idle_stop(self):
+        self._cancel_idle_timer()
+        self._idle_timer = threading.Timer(self._idle_timeout, self._stop_streamor_if_idle)
+        self._idle_timer.daemon = True
+        self._idle_timer.start()
+
+    def _schedule_idle_stop_if_no_clients(self):
+        with self._streamor_lock:
+            if self._stream_clients == 0:
+                self._schedule_idle_stop()
+
+    def _stop_streamor_if_idle(self):
+        with self._streamor_lock:
+            self._idle_timer = None
+            if self._stream_clients == 0 and self._streamor and self._streamor.running:
+                self._logger.info("Stopping RTSP stream after idle timeout")
+                self._streamor.stop()
 
     def get_template_configs(self):
         return [
@@ -233,9 +295,11 @@ class RtspPlugin(octoprint.plugin.StartupPlugin,
             for _ in range(50):  # Wait up to 5 seconds
                 frame = self._streamor.get_snapshot()
                 if frame:
+                    self._schedule_idle_stop_if_no_clients()
                     return flask.Response(frame, mimetype='image/jpeg')
                 time.sleep(0.1)
 
+        self._schedule_idle_stop_if_no_clients()
         return flask.abort(503)
 
     @octoprint.plugin.BlueprintPlugin.route("/control/<direction>", methods=["POST"])

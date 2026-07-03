@@ -6,6 +6,7 @@ import threading
 import time
 import tempfile
 import os
+import re
 
 class Streamor:
     def __init__(self, url, flip_h=False, flip_v=False, rotate_90=False, 
@@ -34,6 +35,7 @@ class Streamor:
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         self.last_frame = None
+        self._last_frame_id = 0
 
         # Thread-safe logging state (initialized once to avoid race conditions)
         self._last_log_time = 0
@@ -50,8 +52,25 @@ class Streamor:
 
     def stop(self):
         self.running = False
-        if self.process:
-            self.process.kill()
+        with self._condition:
+            self._condition.notify_all()
+
+        process = self.process
+        if process:
+            try:
+                process.terminate()
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=1.0)
         self.process = None
@@ -60,6 +79,24 @@ class Streamor:
     def get_snapshot(self):
         with self._lock:
             return self.last_frame
+
+    def wait_for_frame(self, last_frame_id=None, timeout=5.0):
+        """Wait for a new frame without busy polling."""
+        with self._condition:
+            if last_frame_id is None and self.last_frame:
+                return self._last_frame_id, self.last_frame
+
+            end_time = time.time() + timeout
+            while self.running:
+                if self.last_frame and self._last_frame_id != last_frame_id:
+                    return self._last_frame_id, self.last_frame
+
+                remaining = end_time - time.time()
+                if remaining <= 0:
+                    break
+                self._condition.wait(timeout=remaining)
+
+            return self._last_frame_id, None
 
     def _sanitize_url(self, url):
         # Mask password in rtsp://user:pass@host format
@@ -79,12 +116,21 @@ class Streamor:
     def _build_command(self):
         # Build FFmpeg filters
         filters = []
+        framerate = self._validated_framerate()
         if self.flip_h:
             filters.append("hflip")
         if self.flip_v:
             filters.append("vflip")
         if self.rotate_90:
             filters.append("transpose=1") # 90 degrees clockwise
+        if framerate:
+            filters.append(f"fps={framerate}")
+        if self.resolution:
+            if re.match(r"^\d+x\d+$", self.resolution):
+                width, height = self.resolution.split("x", 1)
+                filters.append(f"scale={width}:{height}")
+            else:
+                self.logger.warning(f"Streamor: Ignoring invalid resolution: {self.resolution}")
 
         filter_arg = []
         if filters:
@@ -94,21 +140,22 @@ class Streamor:
         args = [
             'ffmpeg',
             '-y',
+            '-hide_banner',
+            '-loglevel', 'warning',
+            '-nostdin',
             '-rtsp_transport', 'tcp',
             '-rtsp_flags', 'prefer_tcp',
             '-timeout', '5000000',
+            '-fflags', 'nobuffer',
             '-i', self.url,
+            '-an',
+            '-sn',
+            '-dn',
             '-f', 'image2pipe',
             '-pix_fmt', 'yuv420p',
             '-vcodec', 'mjpeg',
             '-q:v', '5',
         ]
-
-        if self.framerate:
-             args.extend(['-r', str(self.framerate)])
-        
-        if self.resolution:
-             args.extend(['-s', self.resolution])
              
         if self.bitrate:
              args.extend(['-b:v', self.bitrate])
@@ -132,6 +179,23 @@ class Streamor:
 
         return args
 
+    def _validated_framerate(self):
+        try:
+            framerate = int(self.framerate)
+        except (TypeError, ValueError):
+            self.logger.warning(f"Streamor: Ignoring invalid framerate: {self.framerate}")
+            return None
+
+        if framerate < 1:
+            self.logger.warning(f"Streamor: Ignoring invalid framerate: {self.framerate}")
+            return None
+
+        if framerate > 30:
+            self.logger.warning(f"Streamor: Clamping framerate from {framerate} to 30")
+            return 30
+
+        return framerate
+
     def _capture_loop(self):
         if self.url == "TEST":
             self.logger.info("Streamor: Starting TEST PATTERN mode")
@@ -148,6 +212,7 @@ class Streamor:
             while self.running:
                 with self._condition:
                     self.last_frame = frame
+                    self._last_frame_id += 1
                     self._condition.notify_all()
                 time.sleep(1.0 / (self.framerate if self.framerate else 15))
             return
@@ -171,7 +236,7 @@ class Streamor:
                 )
                 
                 # Start stderr reader thread
-                self._stderr_thread = threading.Thread(target=self._monitor_stderr)
+                self._stderr_thread = threading.Thread(target=self._monitor_stderr, args=(self.process,))
                 self._stderr_thread.daemon = True
                 self._stderr_thread.start()
             except FileNotFoundError:
@@ -185,7 +250,7 @@ class Streamor:
                 time.sleep(5)
                 continue
 
-            buffer = b''
+            buffer = bytearray()
             chunk_size = 32768 # Increased chunk size for better performance
 
             while self.running and self.process.poll() is None:
@@ -193,17 +258,17 @@ class Streamor:
                     data = self.process.stdout.read(chunk_size)
                     if not data:
                         break # EOF
-                    buffer += data
+                    buffer.extend(data)
                     
                     while True:
                         a = buffer.find(b'\xff\xd8')
                         if a == -1:
                             if len(buffer) > 4096: # Prevent buffer from growing infinitely if no headers found
-                                buffer = buffer[-4096:]
+                                del buffer[:-4096]
                             break
                         
                         if a > 0:
-                            buffer = buffer[a:]
+                            del buffer[:a]
                         
                         b = buffer.find(b'\xff\xd9')
                         if b == -1:
@@ -212,14 +277,15 @@ class Streamor:
                             # Typical MJPEG frames are 50-300KB; 2MB indicates malformed data
                             if len(buffer) > 2000000:
                                 self.logger.warning("Streamor: Frame exceeded 2MB limit, dropping buffer")
-                                buffer = b''
+                                buffer.clear()
                             break
                         
-                        jpg = buffer[:b+2]
-                        buffer = buffer[b+2:]
+                        jpg = bytes(buffer[:b+2])
+                        del buffer[:b+2]
                         
                         with self._condition:
                             self.last_frame = jpg
+                            self._last_frame_id += 1
                             self._condition.notify_all()
                         
                         # Debug logging (rate limited)
@@ -277,13 +343,13 @@ class Streamor:
                     self._last_yield_log = time.time()
                 yield frame_data
 
-    def _monitor_stderr(self):
+    def _monitor_stderr(self, process):
         """Reads stderr from the ffmpeg process and logs it."""
-        if not self.process or not self.process.stderr:
+        if not process or not process.stderr:
             return
 
         try:
-            for line in iter(self.process.stderr.readline, b''):
+            for line in iter(process.stderr.readline, b''):
                 if line:
                     line_str = line.decode('utf-8', errors='ignore').strip()
                     self.logger.info(f"FFmpeg: {line_str}")
