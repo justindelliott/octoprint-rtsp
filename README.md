@@ -55,7 +55,7 @@ Nathen Fredrick (soopahfly@gmail.com)
 
 ## Changelog
 
-### Unreleased
+### v1.0.4
 - **Improved**: Reduced CPU and memory pressure when transcoding RTSP streams for low-power devices like Raspberry Pi 3B
 - **Improved**: FFmpeg now applies framerate and resolution limits before MJPEG encoding
 - **Improved**: Streaming no longer blocks Tornado's I/O loop while waiting for frames
